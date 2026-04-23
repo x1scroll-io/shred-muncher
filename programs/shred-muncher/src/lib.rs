@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
-declare_id!("4jekyzVvjUDzUydX7b5vBBi4tX5BJZQDjZkC8hMcvbNn"); // replace after deploy
+declare_id!("4jekyzVvjUDzUydX7b5vBBi4tX5BJZQDjZkC8hMcvbNn"); // v0.2 — permissionless
 
 // ── CONSTANTS (immutable) ─────────────────────────────────────────────────────
 const TREASURY: &str = "A1TRS3i2g62Zf6K4vybsW4JLx8wifqSoThyTQqXNaLDK";
@@ -29,6 +29,13 @@ const MAX_MUNCHERS: usize = 50;
 
 // Max shred log entries
 const MAX_SHRED_LOG: usize = 1000;
+
+// FIX: Permissionless slashing — 2/3 majority vote required
+const SLASH_QUORUM_NUMERATOR: u64 = 2;
+const SLASH_QUORUM_DENOMINATOR: u64 = 3;
+
+// Vote window: 3 epochs to accumulate votes before slash finalizes
+const SLASH_VOTE_WINDOW_EPOCHS: u64 = 3;
 
 /// Shred types — what gets munched
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq)]
@@ -120,6 +127,8 @@ pub mod shred_muncher {
             bad_cleanups: 0,
             active: true,
             registered_epoch: Clock::get()?.epoch,
+            slash_votes: 0,
+            slash_vote_initiated_epoch: 0,
         };
         state.muncher_count += 1;
 
@@ -266,16 +275,90 @@ pub mod shred_muncher {
         Ok(())
     }
 
-    /// Slash a muncher for bad cleanup (authority resolves disputes)
-    pub fn slash_muncher(
-        ctx: Context<SlashMuncher>,
-        operator_identity: Pubkey,
+    /// FIX: Permissionless slash vote — any muncher can vote to slash a bad actor
+    /// No authority needed. 2/3 majority in 3-epoch window = slash executes.
+    pub fn vote_to_slash(
+        ctx: Context<VoteToSlash>,
+        target_operator: Pubkey,
+        shred_log_index: u32,
     ) -> Result<()> {
         let state = &mut ctx.accounts.state;
-        require!(ctx.accounts.authority.key() == state.authority, MuncherError::Unauthorized);
+        let voter = ctx.accounts.voter.key();
+        let current_epoch = Clock::get()?.epoch;
+
+        // Verify voter is a registered active muncher
+        let mut is_muncher = false;
+        for i in 0..state.muncher_count as usize {
+            if state.munchers[i].operator == voter && state.munchers[i].active {
+                is_muncher = true;
+                break;
+            }
+        }
+        require!(is_muncher, MuncherError::NotAMuncher);
+        require!(voter != target_operator, MuncherError::CannotVoteForSelf);
+
+        // Find target and record vote
+        for i in 0..state.muncher_count as usize {
+            if state.munchers[i].operator == target_operator {
+                require!(state.munchers[i].active, MuncherError::MuncherNotFound);
+
+                // Start or continue vote window
+                if state.munchers[i].slash_votes == 0 {
+                    state.munchers[i].slash_vote_initiated_epoch = current_epoch;
+                }
+
+                // Check vote window still open
+                require!(
+                    current_epoch <= state.munchers[i].slash_vote_initiated_epoch + SLASH_VOTE_WINDOW_EPOCHS,
+                    MuncherError::VoteWindowClosed
+                );
+
+                state.munchers[i].slash_votes += 1;
+
+                // Check if quorum reached
+                let active_munchers = state.munchers[..state.muncher_count as usize]
+                    .iter()
+                    .filter(|m| m.active)
+                    .count() as u64;
+                let required = (active_munchers * SLASH_QUORUM_NUMERATOR + SLASH_QUORUM_DENOMINATOR - 1)
+                    / SLASH_QUORUM_DENOMINATOR;
+
+                emit!(SlashVoteCast {
+                    target: target_operator,
+                    voter,
+                    votes: state.munchers[i].slash_votes,
+                    required: required as u32,
+                    slot: Clock::get()?.slot,
+                });
+                return Ok(());
+            }
+        }
+        Err(MuncherError::MuncherNotFound.into())
+    }
+
+    /// Finalize slash after 2/3 quorum vote — permissionless, anyone can call
+    pub fn finalize_slash_vote(
+        ctx: Context<FinalizeSlashVote>,
+        target_operator: Pubkey,
+    ) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+        let current_epoch = Clock::get()?.epoch;
+
+        let active_munchers = state.munchers[..state.muncher_count as usize]
+            .iter()
+            .filter(|m| m.active)
+            .count() as u64;
+        let required = (active_munchers * SLASH_QUORUM_NUMERATOR + SLASH_QUORUM_DENOMINATOR - 1)
+            / SLASH_QUORUM_DENOMINATOR;
 
         for i in 0..state.muncher_count as usize {
-            if state.munchers[i].operator == operator_identity {
+            if state.munchers[i].operator == target_operator {
+                require!(state.munchers[i].slash_votes as u64 >= required, MuncherError::InsufficientVotes);
+                require!(
+                    current_epoch <= state.munchers[i].slash_vote_initiated_epoch + SLASH_VOTE_WINDOW_EPOCHS,
+                    MuncherError::VoteWindowClosed
+                );
+
                 let slash = state.munchers[i].bond_amount * SLASH_BPS / BASIS_POINTS;
                 let treasury_cut = slash * TREASURY_BPS / BASIS_POINTS;
                 let burn_cut = slash - treasury_cut;
@@ -289,9 +372,10 @@ pub mod shred_muncher {
 
                 state.munchers[i].bond_amount = state.munchers[i].bond_amount.saturating_sub(slash);
                 state.munchers[i].bad_cleanups += 1;
+                state.munchers[i].slash_votes = 0;
                 state.total_burned = state.total_burned.checked_add(burn_cut).ok_or(MuncherError::MathOverflow)?;
 
-                emit!(MuncherSlashed { operator: operator_identity, slash_amount: slash, burned: burn_cut, epoch: Clock::get()?.epoch });
+                emit!(MuncherSlashed { operator: target_operator, slash_amount: slash, burned: burn_cut, epoch: current_epoch });
                 return Ok(());
             }
         }
@@ -361,10 +445,17 @@ pub struct DisputeCleanup<'info> {
 }
 
 #[derive(Accounts)]
-pub struct SlashMuncher<'info> {
+pub struct VoteToSlash<'info> {
     #[account(mut, seeds = [b"shred-muncher"], bump = state.bump)]
     pub state: Account<'info, MuncherState>,
-    pub authority: Signer<'info>,
+    pub voter: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct FinalizeSlashVote<'info> {
+    #[account(mut, seeds = [b"shred-muncher"], bump = state.bump)]
+    pub state: Account<'info, MuncherState>,
+    pub caller: Signer<'info>,
     /// CHECK: bond vault
     #[account(mut, seeds = [b"muncher-vault"], bump)]
     pub bond_vault: AccountInfo<'info>,
@@ -408,8 +499,10 @@ pub struct MuncherNode {
     pub bad_cleanups: u32,
     pub active: bool,
     pub registered_epoch: u64,
+    pub slash_votes: u32,              // FIX: vote count for permissionless slash
+    pub slash_vote_initiated_epoch: u64, // FIX: when voting started
 }
-impl MuncherNode { pub const LEN: usize = 32 + 8 + 1 + 64 + 8 + 4 + 1 + 8; }
+impl MuncherNode { pub const LEN: usize = 32 + 8 + 1 + 64 + 8 + 4 + 1 + 8 + 4 + 8; }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
 pub struct ShredLog {
@@ -436,6 +529,8 @@ pub struct Subscribed { pub subscriber: Pubkey, pub expires_epoch: u64, pub fee:
 #[event]
 pub struct CleanupDisputed { pub shred_log_index: u32, pub challenger: Pubkey, pub disputed_muncher: Pubkey, pub slot: u64 }
 #[event]
+pub struct SlashVoteCast { pub target: Pubkey, pub voter: Pubkey, pub votes: u32, pub required: u32, pub slot: u64 }
+#[event]
 pub struct MuncherSlashed { pub operator: Pubkey, pub slash_amount: u64, pub burned: u64, pub epoch: u64 }
 
 // ── ERRORS ────────────────────────────────────────────────────────────────────
@@ -460,6 +555,12 @@ pub enum MuncherError {
     Unauthorized,
     #[msg("Math overflow")]
     MathOverflow,
+    #[msg("Cannot vote to slash yourself")]
+    CannotVoteForSelf,
+    #[msg("Insufficient votes for slash — need 2/3 majority")]
+    InsufficientVotes,
+    #[msg("Vote window closed — 3 epoch window expired")]
+    VoteWindowClosed,
     #[msg("Invalid treasury")]
     InvalidTreasury,
     #[msg("Invalid burn address")]
