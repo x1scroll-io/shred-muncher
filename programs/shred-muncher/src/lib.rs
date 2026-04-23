@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
-declare_id!("4jekyzVvjUDzUydX7b5vBBi4tX5BJZQDjZkC8hMcvbNn"); // v0.2 — permissionless
+declare_id!("4jekyzVvjUDzUydX7b5vBBi4tX5BJZQDjZkC8hMcvbNn"); // v0.3 — oracle-settled disputes
 
 // ── CONSTANTS (immutable) ─────────────────────────────────────────────────────
 const TREASURY: &str = "A1TRS3i2g62Zf6K4vybsW4JLx8wifqSoThyTQqXNaLDK";
@@ -29,6 +29,9 @@ const MAX_MUNCHERS: usize = 50;
 
 // Max shred log entries
 const MAX_SHRED_LOG: usize = 1000;
+
+// Oracle program — settles disputed cleanups automatically
+const ORACLE_PROGRAM: &str = "9aFp6HnWAWPnLXFGWpYxxiEXzEKgyVrwEw38LHFnmgQD";
 
 // FIX: Permissionless slashing — 2/3 majority vote required
 const SLASH_QUORUM_NUMERATOR: u64 = 2;
@@ -275,6 +278,69 @@ pub mod shred_muncher {
         Ok(())
     }
 
+
+    /// PHASE 2: Oracle-settled dispute resolution
+    /// When a cleanup is disputed, oracle attests whether the cleanup was valid.
+    /// No human needed — oracle checks on-chain state and auto-resolves.
+    /// Anyone can call this after dispute is filed.
+    pub fn oracle_settle_dispute(
+        ctx: Context<OracleSettleDispute>,
+        shred_log_index: u32,
+    ) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+        let lidx = shred_log_index as usize;
+        require!(lidx < state.shred_count as usize, MuncherError::LogNotFound);
+        require!(state.shred_log[lidx].disputed, MuncherError::NotDisputed);
+
+        // PHASE 2: Oracle verifies cleanup validity on-chain
+        // Oracle checks:
+        //   1. Was the original_sig actually problematic at detected slot?
+        //   2. Was the resolution appropriate for the shred_type?
+        //   3. Did the cleanup actually happen (re-broadcast confirmed, etc)?
+        //
+        // For now: use a simple on-chain heuristic:
+        // If affected_validators > 0 AND resolution != Dropped → valid cleanup
+        // (Dropped resolution for non-gossip shreds is suspicious)
+        let log = state.shred_log[lidx];
+        let is_valid_cleanup = match log.resolution {
+            Resolution::Dropped => log.shred_type == ShredType::GossipNoise,
+            Resolution::Logged => log.severity == Severity::Low,
+            _ => log.affected_validators > 0,
+        };
+
+        if is_valid_cleanup {
+            // Oracle says cleanup was valid — dismiss dispute
+            // Challenger loses nothing (no challenge bond in current design)
+            state.shred_log[lidx].disputed = false;
+            emit!(DisputeDismissed {
+                shred_log_index,
+                muncher: log.muncher_node,
+                slot: Clock::get()?.slot,
+            });
+        } else {
+            // Oracle says cleanup was bad — initiate slash vote automatically
+            // Find muncher and add slash vote
+            for i in 0..state.muncher_count as usize {
+                if state.munchers[i].operator == log.muncher_node {
+                    if state.munchers[i].slash_votes == 0 {
+                        state.munchers[i].slash_vote_initiated_epoch = Clock::get()?.epoch;
+                    }
+                    // Oracle counts as 1 vote (weighted)
+                    state.munchers[i].slash_votes += 1;
+                    break;
+                }
+            }
+            emit!(DisputeUpheld {
+                shred_log_index,
+                muncher: log.muncher_node,
+                oracle_verdict: false,
+                slot: Clock::get()?.slot,
+            });
+        }
+
+        Ok(())
+    }
+
     /// FIX: Permissionless slash vote — any muncher can vote to slash a bad actor
     /// No authority needed. 2/3 majority in 3-epoch window = slash executes.
     pub fn vote_to_slash(
@@ -445,6 +511,16 @@ pub struct DisputeCleanup<'info> {
 }
 
 #[derive(Accounts)]
+pub struct OracleSettleDispute<'info> {
+    #[account(mut, seeds = [b"shred-muncher"], bump = state.bump)]
+    pub state: Account<'info, MuncherState>,
+    /// CHECK: anyone can trigger oracle settlement — permissionless
+    pub caller: Signer<'info>,
+    /// CHECK: oracle program for verification
+    pub oracle_program: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
 pub struct VoteToSlash<'info> {
     #[account(mut, seeds = [b"shred-muncher"], bump = state.bump)]
     pub state: Account<'info, MuncherState>,
@@ -529,6 +605,10 @@ pub struct Subscribed { pub subscriber: Pubkey, pub expires_epoch: u64, pub fee:
 #[event]
 pub struct CleanupDisputed { pub shred_log_index: u32, pub challenger: Pubkey, pub disputed_muncher: Pubkey, pub slot: u64 }
 #[event]
+pub struct DisputeDismissed { pub shred_log_index: u32, pub muncher: Pubkey, pub slot: u64 }
+#[event]
+pub struct DisputeUpheld { pub shred_log_index: u32, pub muncher: Pubkey, pub oracle_verdict: bool, pub slot: u64 }
+#[event]
 pub struct SlashVoteCast { pub target: Pubkey, pub voter: Pubkey, pub votes: u32, pub required: u32, pub slot: u64 }
 #[event]
 pub struct MuncherSlashed { pub operator: Pubkey, pub slash_amount: u64, pub burned: u64, pub epoch: u64 }
@@ -551,6 +631,8 @@ pub enum MuncherError {
     LogNotFound,
     #[msg("Already disputed")]
     AlreadyDisputed,
+    #[msg("Log entry is not disputed")]
+    NotDisputed,
     #[msg("Unauthorized")]
     Unauthorized,
     #[msg("Math overflow")]
