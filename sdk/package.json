@@ -1,0 +1,8 @@
+{
+  "name": "@x1scroll/shred-muncher",
+  "version": "0.1.0",
+  "description": "Network cleanup SDK for X1 — detect, classify, and resolve shred chaos",
+  "main": "index.js",
+  "author": "x1scroll.io",
+  "license": "MIT"
+}
